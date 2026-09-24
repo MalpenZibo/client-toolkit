@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto,
-    env,
+    env, fmt,
     fmt::Debug,
     marker::PhantomData,
     num::NonZeroU32,
@@ -285,7 +285,74 @@ pub struct KeyEvent {
     /// UTF-8 interpretation of the entered text.
     ///
     /// This will always be [`None`] on release events.
-    pub utf8: Option<String>,
+    pub utf8: Option<KeyText>,
+}
+
+/// UTF-8 text produced by a key press, stored inline without allocating.
+///
+/// Dereferences to `str`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct KeyText {
+    bytes: [u8; KeyText::CAPACITY],
+    len: u8,
+}
+
+impl KeyText {
+    /// Buffer size recommended by libxkbcommon.
+    const CAPACITY: usize = 64;
+
+    /// Get the text as a string slice.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: libxkbcommon writes valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len as usize]) }
+    }
+
+    /// Returns `None` if the text does not fit in the buffer.
+    fn fill(write: impl FnOnce(*mut std::ffi::c_char, usize) -> std::ffi::c_int) -> Option<Self> {
+        let mut text = Self { bytes: [0; Self::CAPACITY], len: 0 };
+        let needed = write(text.bytes.as_mut_ptr().cast(), Self::CAPACITY);
+        let needed = usize::try_from(needed).ok()?;
+        if needed >= Self::CAPACITY {
+            return None;
+        }
+        text.len = needed as u8;
+        Some(text)
+    }
+
+    /// Text for a key in the current state, possibly empty.
+    fn from_key(state: &xkb::State, keycode: KeyCode) -> Option<Self> {
+        Self::fill(|buf, size| unsafe {
+            xkb::ffi::xkb_state_key_get_utf8(state.get_raw_ptr(), keycode.into(), buf, size)
+        })
+    }
+
+    /// Text for a finished compose sequence.
+    fn from_compose(compose: &xkb::compose::State) -> Option<Self> {
+        Self::fill(|buf, size| unsafe {
+            xkb::ffi::compose::xkb_compose_state_get_utf8(compose.get_raw_ptr(), buf, size)
+        })
+        .filter(|text| text.len > 0)
+    }
+}
+
+impl std::ops::Deref for KeyText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for KeyText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for KeyText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// State of keyboard modifiers, in raw form sent by compositor.
@@ -646,14 +713,14 @@ where
                                 Some(compose) => match compose.feed(keysym) {
                                     xkb::FeedResult::Ignored => None,
                                     xkb::FeedResult::Accepted => match compose.status() {
-                                        xkb::Status::Composed => compose.utf8(),
-                                        xkb::Status::Nothing => Some(guard.key_get_utf8(keycode)),
+                                        xkb::Status::Composed => KeyText::from_compose(compose),
+                                        xkb::Status::Nothing => KeyText::from_key(guard, keycode),
                                         _ => None,
                                     },
                                 },
 
                                 // No compose
-                                None => Some(guard.key_get_utf8(keycode)),
+                                None => KeyText::from_key(guard, keycode),
                             }
                         } else {
                             None
@@ -826,10 +893,10 @@ where
                                 Some(compose) => match compose.feed(event.key.keysym) {
                                     xkb::FeedResult::Ignored => None,
                                     xkb::FeedResult::Accepted => match compose.status() {
-                                        xkb::Status::Composed => compose.utf8(),
-                                        xkb::Status::Nothing => Some(
-                                            state
-                                                .key_get_utf8(KeyCode::new(event.key.raw_code + 8)),
+                                        xkb::Status::Composed => KeyText::from_compose(compose),
+                                        xkb::Status::Nothing => KeyText::from_key(
+                                            state,
+                                            KeyCode::new(event.key.raw_code + 8),
                                         ),
                                         _ => None,
                                     },
@@ -837,7 +904,7 @@ where
 
                                 // No compose.
                                 None => {
-                                    Some(state.key_get_utf8(KeyCode::new(event.key.raw_code + 8)))
+                                    KeyText::from_key(state, KeyCode::new(event.key.raw_code + 8))
                                 }
                             }
                         };
@@ -882,5 +949,48 @@ where
 
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::KeyText;
+
+    /// Mimics libxkbcommon's `*_get_utf8` functions.
+    fn writes(text: &str) -> impl FnOnce(*mut std::ffi::c_char, usize) -> std::ffi::c_int + '_ {
+        move |buf, size| {
+            let n = text.len().min(size.saturating_sub(1));
+            unsafe {
+                std::ptr::copy_nonoverlapping(text.as_ptr(), buf.cast(), n);
+                *buf.add(n) = 0;
+            }
+            text.len() as std::ffi::c_int
+        }
+    }
+
+    #[test]
+    fn test_key_text_round_trip() {
+        let text = KeyText::fill(writes("é")).unwrap();
+        assert_eq!(&*text, "é");
+        assert_eq!(text.to_string(), "é");
+        assert_eq!(format!("{text:?}"), "\"é\"");
+    }
+
+    #[test]
+    fn test_key_text_empty() {
+        assert_eq!(&*KeyText::fill(writes("")).unwrap(), "");
+    }
+
+    #[test]
+    fn test_key_text_too_long() {
+        let long = "x".repeat(KeyText::CAPACITY);
+        assert!(KeyText::fill(writes(&long)).is_none());
+        let fits = "x".repeat(KeyText::CAPACITY - 1);
+        assert_eq!(&*KeyText::fill(writes(&fits)).unwrap(), fits);
+    }
+
+    #[test]
+    fn test_key_text_error() {
+        assert!(KeyText::fill(|_, _| -1).is_none());
     }
 }

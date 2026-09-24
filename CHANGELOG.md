@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+#### Breaking Changes
+- `KeyEvent::utf8` is now `Option<KeyText>`, which stores the text inline
+  instead of allocating a `String`.
+
 ## 0.21.1 - 2026-07-23
 - Fix trait bound for `WlTouch` dispatch implementation
 
